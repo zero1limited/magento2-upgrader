@@ -1,0 +1,154 @@
+#!/bin/bash
+
+POSITIONAL_ARGS=()
+
+MAGENTO_VERSION=""
+
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    # --dry-run)
+    #   DRY_RUN="YES"
+    #   shift # past argument
+    #   ;;
+    -m|--magento-version)
+      MAGENTO_VERSION="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    -*|--*)
+      echo "Unknown option $1"
+      exit 1
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1") # save positional arg
+      shift # past argument
+      ;;
+  esac
+done
+
+set -- "${POSITIONAL_ARGS[@]}" # restore positional parameters
+
+debug() {
+  echo "[$(date +%Y-%m-%d\ %H:%M:%S)] $@"
+}
+
+installModule() {
+  local moduleName=$1
+
+  composer require "$moduleName" --no-interaction >> tmp/module-install.log 2>&1
+  echo "$?"
+}
+
+
+if [ -z "$MAGENTO_VERSION" ]; then
+  echo "Error: Magento version is required. Use -m or --magento-version to specify it."
+  exit 1
+fi
+
+debug "Starting Magento upgrade to version $MAGENTO_VERSION"
+
+# check all well at present
+debug "Checking current composer setup..."
+rm -rf vendor || true
+composer install --no-interaction --ignore-platform-reqs
+
+
+debug "Preparing temporary files..."
+rm -rf tmp || true
+mkdir -p tmp
+
+# get the template composer json
+composer create-project --repository-url=https://repo.magento.com/ --no-install --no-interaction --no-plugins -- magento/project-community-edition=$MAGENTO_VERSION tmp
+
+# dump repository copy script
+cat >./tmp/repo-copy.php <<'EOL'
+<?php
+$composerJson = json_decode(file_get_contents("composer.json.bak"), true); 
+$newComposerJson = json_decode(file_get_contents("composer.json"), true); 
+$newComposerJson["repositories"] = $composerJson["repositories"]; 
+file_put_contents("composer.json", json_encode($newComposerJson, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));
+EOL
+
+# dump patch restore script
+cat >./tmp/patches-copy.php <<'EOL'
+<?php
+$composerJson = json_decode(file_get_contents("composer.json.bak"), true); 
+$newComposerJson = json_decode(file_get_contents("composer.json"), true); 
+if (isset($composerJson["extra"]["patches"])) {
+    $newComposerJson["extra"]["patches"] = $composerJson["extra"]["patches"];
+    $newComposerJson["config"]["allow-plugins"]["cweagans/composer-patches"] = true;
+    file_put_contents("composer.json", json_encode($newComposerJson, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));
+}
+EOL
+
+# module diff script
+cat >./tmp/module-diff.php <<'EOL'
+<?php
+$composerJson = json_decode(file_get_contents("composer.json.bak"), true); 
+$newComposerJson = json_decode(file_get_contents("composer.json"), true); 
+
+$modulesToBeReAdded = [];
+foreach ($composerJson['require'] as $package => $version) {
+    if (!isset($newComposerJson['require'][$package])) {
+        $modulesToBeReAdded[] = $package;
+    }
+}
+
+echo implode(' ', $modulesToBeReAdded).PHP_EOL;
+EOL
+
+# make a backup of the current composer.json
+debug "Backing up current composer.json..."
+cp composer.json composer.json.bak
+
+# replace the current composer.json with the template one
+debug "Replacing composer.json with Magento $MAGENTO_VERSION template..."
+cp tmp/composer.json composer.json
+
+# remove lock
+debug "Removing composer.lock..."
+rm -f composer.lock || true
+
+# run composer install
+debug "Running composer install for Magento $MAGENTO_VERSION..."
+composer install --no-interaction
+
+# restore repositories
+debug "Restoring repositories..."
+php tmp/repo-copy.php
+
+# restore patches
+debug "Restoring patches..."
+php tmp/patches-copy.php
+
+# re-check composer install
+debug "Running composer install to re-apply repositories and patches..."
+composer install --no-interaction
+
+# get a list of all module that need to be re-required
+modules=$(php tmp/module-diff.php);
+failedModules=""
+debug "Modules to be re-installed: $modules"
+for module in $modules; do
+  debug "Re-installing module: $module"
+  exitCode=$(installModule "$module")
+  if [ "$exitCode" -ne 0 ]; then
+    debug "Install failed (exit code $exitCode)."
+    failedModules="$failedModules $module\r\n"
+  else
+    debug "Install succeeded."
+  fi
+done
+
+debug "The following modules failed to install:$failedModules"
+
+debug "Magento upgrade to version $MAGENTO_VERSION completed."
+debug "Please review the below diff to make sure nothing has been missed"
+diff -u composer.json.bak composer.json || true
+
+# Maybe print out diff of versions from locks before and after?
+
+debug "You can clean up temporary files by removing the tmp/ directory. (rm -rf tmp)"
+
+exit 0
