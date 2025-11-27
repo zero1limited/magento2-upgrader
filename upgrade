@@ -73,10 +73,18 @@ cat >./tmp/patches-copy.php <<'EOL'
 <?php
 $composerJson = json_decode(file_get_contents("composer.json.bak"), true); 
 $newComposerJson = json_decode(file_get_contents("composer.json"), true); 
+$changes = false
 if (isset($composerJson["extra"]["patches"])) {
     $newComposerJson["extra"]["patches"] = $composerJson["extra"]["patches"];
     $newComposerJson["config"]["allow-plugins"]["cweagans/composer-patches"] = true;
-    file_put_contents("composer.json", json_encode($newComposerJson, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));
+    $changes = true;
+}
+if (array_key_exists("composer-exit-on-patch-failure", $composerJson["extra"])){
+  $newComposerJson["extra"]["composer-exit-on-patch-failure"] = $composerJson["extra"]["composer-exit-on-patch-failure"];
+  $changes = true;
+}
+if($changes){
+  file_put_contents("composer.json", json_encode($newComposerJson, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));
 }
 EOL
 
